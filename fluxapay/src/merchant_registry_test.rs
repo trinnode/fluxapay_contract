@@ -360,6 +360,7 @@ fn test_unverified_merchant_cannot_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
 
     // This should panic with Unauthorized error
@@ -420,6 +421,7 @@ fn test_verified_merchant_can_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     };
 
     let payment = payment_client.create_payment(&args);
@@ -452,7 +454,7 @@ fn test_suspend_merchant() {
     );
 
     let reason = String::from_str(&env, "Fraudulent activity");
-    client.suspend_merchant(&admin, &merchant_id, &reason);
+    client.suspend_merchant(&admin, &merchant_id, &reason, &0u64);
 
     let merchant = client.get_merchant(&merchant_id);
     assert!(!merchant.active);
@@ -483,7 +485,7 @@ fn test_reinstate_merchant() {
     );
 
     let reason = String::from_str(&env, "Fraudulent activity");
-    client.suspend_merchant(&admin, &merchant_id, &reason);
+    client.suspend_merchant(&admin, &merchant_id, &reason, &0u64);
 
     // Check it's suspended
     let suspended = client.get_merchant(&merchant_id);
@@ -659,7 +661,7 @@ fn test_suspend_merchant_unauthorized() {
         &None,
     );
 
-    client.suspend_merchant(&attacker, &merchant_id, &String::from_str(&env, "Reason"));
+    client.suspend_merchant(&attacker, &merchant_id, &String::from_str(&env, "Reason"), &0u64);
 }
 
 // Tests for issue #208: Content-Addressable Merchant Profiles
@@ -1185,7 +1187,7 @@ fn test_verify_merchant_with_oracle_signature() {
     let signature = String::from_str(&env, "0x1234567890abcdef");
     
     // Verify merchant with oracle signature
-    client.verify_merchant_with_signature(&admin, &merchant_id, &signature);
+    client.verify_merchant_with_signature(&admin, &merchant_id, &Some(signature.clone()));
 
     let merchant = client.get_merchant(&merchant_id);
     assert_eq!(merchant.oracle_signature, Some(signature));
@@ -1216,7 +1218,7 @@ fn test_set_kyc_tier_with_oracle_signature() {
     let signature = String::from_str(&env, "0xabcdef1234567890");
     
     // Set KYC tier with oracle signature
-    client.set_kyc_tier_with_signature(&admin, &merchant_id, &KycTier::Full, &signature);
+    client.set_kyc_tier_with_signature(&admin, &merchant_id, &KycTier::Full, &Some(signature.clone()));
 
     let merchant = client.get_merchant(&merchant_id);
     assert_eq!(merchant.oracle_signature, Some(signature));
@@ -1274,7 +1276,7 @@ fn test_basic_tier_cap_enforced() {
         setup_volume_cap_env(&env);
 
     // Set merchant to Basic tier ($10,000 cap = 100_000_000_000 stroops)
-    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Basic, &String::from_str(&env, "sig"));
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Basic, &Some(String::from_str(&env, "sig")));
 
     let deposit = Address::generate(&env);
 
@@ -1297,7 +1299,7 @@ fn test_basic_tier_cap_enforced() {
     payment_client.verify_payment(
         &oracle,
         &pid1,
-        &soroban_sdk::BytesN::<32>::random(&env),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
         &90_000_000_000,
     );
@@ -1322,7 +1324,7 @@ fn test_basic_tier_cap_enforced() {
     let result = payment_client.try_verify_payment(
         &oracle,
         &pid2,
-        &soroban_sdk::BytesN::<32>::random(&env),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
         &20_000_000_000,
     );
@@ -1339,7 +1341,7 @@ fn test_business_tier_no_cap() {
         setup_volume_cap_env(&env);
 
     // Business tier: unlimited
-    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &String::from_str(&env, "sig"));
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &Some(String::from_str(&env, "sig")));
 
     let deposit = Address::generate(&env);
 
@@ -1362,7 +1364,7 @@ fn test_business_tier_no_cap() {
     payment_client.verify_payment(
         &oracle,
         &pid,
-        &soroban_sdk::BytesN::<32>::random(&env),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
         &10_000_000_000_000,
     );
@@ -1378,7 +1380,7 @@ fn test_volume_resets_next_month() {
     let (admin, payment_client, registry_client, merchant, oracle) =
         setup_volume_cap_env(&env);
 
-    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Basic, &String::from_str(&env, "sig"));
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Basic, &Some(String::from_str(&env, "sig")));
 
     let deposit = Address::generate(&env);
 
@@ -1401,7 +1403,7 @@ fn test_volume_resets_next_month() {
     payment_client.verify_payment(
         &oracle,
         &pid1,
-        &soroban_sdk::BytesN::<32>::random(&env),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
         &100_000_000_000,
     );
@@ -1428,7 +1430,7 @@ fn test_volume_resets_next_month() {
     payment_client.verify_payment(
         &oracle,
         &pid2,
-        &soroban_sdk::BytesN::<32>::random(&env),
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
         &Address::generate(&env),
         &100_000_000_000,
     );

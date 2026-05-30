@@ -1,5 +1,6 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
+use crate::merchant_registry::KycTier;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, vec, Address, BytesN, Env,
     MuxedAddress, String, Symbol, Vec,
@@ -45,6 +46,7 @@ pub(crate) const ZERO_CONTRACT_STRKEY: &str =
     "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
 mod access_control;
+pub mod account_abstraction;
 mod dex_router;
 pub mod fx_oracle;
 pub mod merchant_auth;
@@ -94,6 +96,17 @@ pub struct PaymentCharge {
     pub original_token: Option<Address>,
     /// Issue #173: Swap path used in swap_and_pay (for refund routing).
     pub swap_path: Option<Vec<Address>>,
+    /// Issue #304: FX rate snapshot captured during verify_payment.
+    pub fx_rate: Option<i128>,
+    /// Issue #304: Timestamp when the FX rate was captured.
+    pub fx_rate_at: Option<u64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycTierLimits {
+    pub tier: KycTier,
+    pub max_amount: i128,
 }
 
 #[contracttype]
@@ -240,11 +253,15 @@ pub enum Error {
     /// Fee proposal has not matured for the required 7 days.
     FeeProposalNotReady = 39,
     /// No active fee proposal found.
-    NoFeeProposal = 39,
+    NoFeeProposal = 44,
     /// Issue #180: Evidence field is not a valid IPFS multihash.
     InvalidEvidence = 40,
     /// Issue #185: One or both collaborative settlement signatures are invalid.
     InvalidSettlementSignature = 41,
+    /// Issue #303: FX oracle rate is stale or unavailable.
+    StaleOracleRate = 45,
+    /// Issue #313: Reentrancy detected in process_refund_internal or settle_payment.
+    Reentrancy = 43,
 }
 
 #[contracttype]
@@ -570,6 +587,18 @@ pub enum DataKey {
     MerchantPaymentCount(Address),
     /// Issue #185: Collaborative settlement record for a dispute.
     CollaborativeSettlement(String),
+    /// Issue #301: List of supported token addresses for enumeration.
+    SupportedTokens,
+    /// Issue #303: KYC tier limits configuration.
+    KycTierLimitsConfig,
+    /// Issue #302: List of active subscription IDs for process_due_subscriptions.
+    ActiveSubscriptions,
+    /// Issue #304: FX Oracle contract address for rate staleness checks.
+    FXOracleAddress,
+    /// Issue #302: Counter for subscription tick payment IDs.
+    SubscriptionTickCounter,
+    /// Issue #313: Reentrancy lock for process_refund_internal and settle_payment.
+    ReentrancyLock,
 }
 
 // When building for WASM deployment, only the active contract's #[contractimpl]
@@ -640,7 +669,7 @@ impl RefundManager {
     /// Synchronize a role grant across PaymentProcessor and RefundManager.
     ///
     /// If either grant fails, the transaction aborts and no changes are persisted.
-    pub fn sync_grant_role_with_payment_processor(
+    pub fn sync_grant_role_with_processor(
         env: Env,
         admin: Address,
         payment_processor_address: Address,
@@ -675,7 +704,7 @@ impl RefundManager {
     /// Synchronize a role revoke across PaymentProcessor and RefundManager.
     ///
     /// If either revoke fails, the transaction aborts and no changes are persisted.
-    pub fn sync_revoke_role_with_payment_processor(
+    pub fn sync_revoke_role_with_processor(
         env: Env,
         admin: Address,
         payment_processor_address: Address,
@@ -705,16 +734,6 @@ impl RefundManager {
         );
 
         Ok(())
-    }
-
-    pub fn revoke_role(
-        env: Env,
-        admin: Address,
-        role: Symbol,
-        account: Address,
-    ) -> Result<(), Error> {
-        AccessControl::revoke_role(&env, admin, role, account)
-            .map_err(|_| Error::AccessControlError)
     }
 
     pub fn has_role(env: Env, role: Symbol, account: Address) -> bool {
@@ -902,6 +921,8 @@ impl RefundManager {
                 metadata_hash: None,
                 original_token: None,
                 swap_path: None,
+                fx_rate: None,
+                fx_rate_at: None,
             };
             env.storage()
                 .persistent()
@@ -1073,11 +1094,37 @@ impl RefundManager {
         Self::process_refund_internal(&env, &operator, refund_id)
     }
 
+    struct ReentrancyGuard<'a> {
+        env: &'a Env,
+    }
+
+    impl<'a> Drop for ReentrancyGuard<'a> {
+        fn drop(&mut self) {
+            self.env
+                .storage()
+                .persistent()
+                .set(&DataKey::ReentrancyLock, &false);
+        }
+    }
+
     fn process_refund_internal(
         env: &Env,
-        operator: &Address,
+        _operator: &Address,
         refund_id: String,
     ) -> Result<(), Error> {
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ReentrancyLock)
+            .unwrap_or(false)
+        {
+            return Err(Error::Reentrancy);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReentrancyLock, &true);
+        let _guard = ReentrancyGuard { env };
+
         let mut refund = Self::get_refund_internal(env, &refund_id)?;
 
         if refund.status != RefundStatus::Pending {
@@ -1095,7 +1142,7 @@ impl RefundManager {
             .persistent()
             .get(&DataKey::UsdcToken)
             .ok_or(Error::Unauthorized)?;
-        let token_client = token::TokenClient::new(env, &usdc_token_address);
+        let _token_client = token::TokenClient::new(env, &usdc_token_address);
 
         // Issue #167: Query merchant's KYC tier and apply tiered refund fee
         let payment: PaymentCharge = env
@@ -2121,7 +2168,7 @@ impl RefundManager {
         }
 
         // Return SHA-256 hash as Bytes
-        let hash: BytesN<32> = env.crypto().sha256(&raw);
+        let hash = env.crypto().sha256(&raw).to_bytes();
         let mut result = Bytes::new(env);
         for i in 0..32u32 {
             result.push_back(hash.get(i).unwrap());
@@ -2701,6 +2748,9 @@ impl RefundManager {
             &payer_subscriptions,
         );
 
+        // Issue #302: Track in ActiveSubscriptions index
+        Self::add_active_subscription(&env, &subscription_id);
+
         env.events().publish(
             (
                 Symbol::new(&env, "SUBSCRIPTION"),
@@ -2747,20 +2797,15 @@ impl RefundManager {
         subscription.status = SubscriptionStatus::Paused;
         env.storage()
             .persistent()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Remove from ActiveSubscriptions index
+        Self::remove_active_subscription(&env, &subscription_id);
 
         Ok(())
     }
 
-    /// Pause a subscription until a specific timestamp, after which it
-    /// automatically resumes on the next `charge_subscription` call.
-    ///
-    /// # Parameters
-    /// * `payer`           – Must be the subscription owner; must sign.
-    /// * `subscription_id` – Subscription to pause.
-    /// * `resume_timestamp`– Unix timestamp at which the subscription should
-    ///                       resume. Must be strictly in the future.
-    pub fn pause_subscription_with_resume_date(
+    pub fn pause_with_resume_date(
         env: Env,
         payer: Address,
         subscription_id: String,
@@ -2789,6 +2834,9 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Remove from ActiveSubscriptions index
+        Self::remove_active_subscription(&env, &subscription_id);
 
         env.events().publish(
             (
@@ -2841,6 +2889,9 @@ impl RefundManager {
                     // Push next payment forward from the resume point.
                     subscription.next_payment_at =
                         resume_at.saturating_add(subscription.interval_secs);
+
+                    // Issue #302: Add back to ActiveSubscriptions index
+                    Self::add_active_subscription(&env, &subscription_id);
 
                     env.events().publish(
                         (
@@ -2947,6 +2998,8 @@ impl RefundManager {
             if let Some(max) = subscription.max_payments {
                 if subscription.total_payments >= max {
                     subscription.status = SubscriptionStatus::Expired;
+                    // Issue #302: Remove from ActiveSubscriptions index
+                    Self::remove_active_subscription(&env, &subscription_id);
                 }
             }
 
@@ -2981,6 +3034,9 @@ impl RefundManager {
                 // Exhausted all retries — cancel the subscription.
                 subscription.status = SubscriptionStatus::Cancelled;
                 subscription.next_retry_at = None;
+
+                // Issue #302: Remove from ActiveSubscriptions index
+                Self::remove_active_subscription(&env, &subscription_id);
 
                 env.storage().persistent().set(
                     &DataKey::Subscription(subscription_id.clone()),
@@ -3057,7 +3113,10 @@ impl RefundManager {
             .saturating_add(subscription.interval_secs);
         env.storage()
             .persistent()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Add back to ActiveSubscriptions index
+        Self::add_active_subscription(&env, &subscription_id);
 
         Ok(())
     }
@@ -3078,7 +3137,10 @@ impl RefundManager {
         subscription.status = SubscriptionStatus::Cancelled;
         env.storage()
             .persistent()
-            .set(&DataKey::Subscription(subscription_id), &subscription);
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Remove from ActiveSubscriptions index
+        Self::remove_active_subscription(&env, &subscription_id);
 
         // Emit cancellation event for consumers and indexers
         env.events().publish((Symbol::new(&env, "SUBSCRIPTION_CANCELLED"),), (payer,));
@@ -3139,7 +3201,64 @@ impl RefundManager {
         Self::charge_subscription(env, operator, subscription_id, token)
     }
 
-    /// Process due subscriptions - called by an operator or oracle
+    /// Issue #302: Track subscription in the ActiveSubscriptions index
+    fn add_active_subscription(env: &Env, subscription_id: &String) {
+        let mut active: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveSubscriptions)
+            .unwrap_or_else(|| vec![env]);
+        let mut found = false;
+        for id in active.iter() {
+            if id == subscription_id.clone() {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            active.push_back(subscription_id.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::ActiveSubscriptions, &active);
+            Self::bump_ttl(env, &DataKey::ActiveSubscriptions, LONG_LIVE_TTL);
+        }
+    }
+
+    /// Issue #302: Remove subscription from the ActiveSubscriptions index
+    fn remove_active_subscription(env: &Env, subscription_id: &String) {
+        let active: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveSubscriptions)
+            .unwrap_or_else(|| vec![env]);
+        let mut updated = vec![env];
+        for id in active.iter() {
+            if id != subscription_id.clone() {
+                updated.push_back(id);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveSubscriptions, &updated);
+        Self::bump_ttl(env, &DataKey::ActiveSubscriptions, LONG_LIVE_TTL);
+    }
+
+    /// Issue #302: Get the next subscription tick counter for payment IDs
+    fn get_next_subscription_tick_id(env: &Env) -> u64 {
+        let mut counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubscriptionTickCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubscriptionTickCounter, &counter);
+        counter
+    }
+
+    /// Issue #302: Process due subscriptions - iterate ActiveSubscriptions and
+    /// create a payment record for each due subscription.
     pub fn process_due_subscriptions(env: Env, operator: Address) -> Result<u32, Error> {
         operator.require_auth();
 
@@ -3149,13 +3268,122 @@ impl RefundManager {
             return Err(Error::Unauthorized);
         }
 
-        let processed_count = 0u32;
+        let active: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveSubscriptions)
+            .unwrap_or_else(|| vec![&env]);
 
-        // Note: In a real implementation, you'd want to iterate through subscriptions
-        // more efficiently. This is a simplified version.
-        // The actual implementation would need a way to track which subscriptions to check.
+        let now = env.ledger().timestamp();
+        let mut total_payments: u32 = 0;
 
-        Ok(processed_count)
+        for subscription_id in active.iter() {
+            let mut subscription = match env
+                .storage()
+                .persistent()
+                .get::<DataKey, Subscription>(&DataKey::Subscription(subscription_id.clone()))
+            {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if subscription.status != SubscriptionStatus::Active {
+                continue;
+            }
+
+            if now < subscription.next_payment_at {
+                continue;
+            }
+
+            let tick_id = Self::get_next_subscription_tick_id(&env);
+            let payment_id = format_id(&env, "sub_tick_", tick_id);
+
+            let payment = PaymentCharge {
+                payment_id: payment_id.clone(),
+                merchant_id: subscription.merchant_id.clone(),
+                amount: subscription.amount,
+                currency: subscription.currency.clone(),
+                deposit_address: env.current_contract_address(),
+                status: PaymentStatus::Pending,
+                payer_address: Some(subscription.payer_address.clone()),
+                transaction_hash: None,
+                created_at: now,
+                confirmed_at: None,
+                expires_at: now.saturating_add(DEFAULT_PAYMENT_DURATION_SECS),
+                amount_received: None,
+                memo: None,
+                memo_type: None,
+                token_address: None,
+                metadata_hash: None,
+                original_token: None,
+                swap_path: None,
+                fx_rate: None,
+                fx_rate_at: None,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id.clone()), &payment);
+            Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+
+            subscription.last_payment_at = Some(now);
+            subscription.total_payments = subscription.total_payments.saturating_add(1);
+            subscription.next_payment_at = now.saturating_add(subscription.interval_secs);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "SUBSCRIPTION"),
+                    Symbol::new(&env, "TICKED"),
+                ),
+                (
+                    subscription_id.clone(),
+                    subscription.payer_address.clone(),
+                    subscription.amount,
+                    subscription.total_payments,
+                ),
+            );
+
+            if let Some(max) = subscription.max_payments {
+                if subscription.total_payments >= max {
+                    subscription.status = SubscriptionStatus::Cancelled;
+                    Self::remove_active_subscription(&env, &subscription_id);
+
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "SUBSCRIPTION"),
+                            Symbol::new(&env, "COMPLETED"),
+                        ),
+                        (
+                            subscription_id.clone(),
+                            subscription.payer_address.clone(),
+                            subscription.total_payments,
+                        ),
+                    );
+
+                    env.events().publish(
+                        (Symbol::new(&env, "SUBSCRIPTION_CANCELLED"),),
+                        (subscription.payer_address.clone(),),
+                    );
+                }
+            }
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "CREATED"),
+                    subscription.merchant_id.clone(),
+                ),
+                (payment_id.clone(), subscription.amount),
+            );
+
+            total_payments = total_payments.saturating_add(1);
+        }
+
+        Ok(total_payments)
     }
 
     fn get_next_subscription_id(env: &Env) -> u64 {
@@ -3232,6 +3460,17 @@ impl RefundManager {
     fn bump_ttl(env: &Env, key: &DataKey, ttl: u32) {
         let threshold = core::cmp::max(1, ttl / TTL_BUMP_THRESHOLD_DIVISOR);
         env.storage().persistent().extend_ttl(key, threshold, ttl);
+    }
+
+    pub fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 }
 
@@ -3330,6 +3569,16 @@ impl PaymentProcessor {
         account: Address,
     ) -> Result<(), Error> {
         AccessControl::grant_role(&env, admin, role, account).map_err(|_| Error::AccessControlError)
+    }
+
+    pub fn revoke_role(
+        env: Env,
+        admin: Address,
+        role: Symbol,
+        account: Address,
+    ) -> Result<(), Error> {
+        AccessControl::revoke_role(&env, admin, role, account)
+            .map_err(|_| Error::AccessControlError)
     }
 
     /// Set the global paused state (admin only). When paused, create_payment, verify_payment, and cancel_payment are blocked.
@@ -3600,7 +3849,102 @@ impl PaymentProcessor {
         }
         env.storage()
             .persistent()
-            .set(&DataKey::AllowedToken(token_address), &true);
+            .set(&DataKey::AllowedToken(token_address.clone()), &true);
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupportedTokens)
+            .unwrap_or(Vec::new(&env));
+        if !tokens.contains(&token_address) {
+            tokens.push_back(token_address);
+            env.storage()
+                .persistent()
+                .set(&DataKey::SupportedTokens, &tokens);
+            Self::bump_ttl(&env, &DataKey::SupportedTokens, LONG_LIVE_TTL);
+        }
+        Ok(())
+    }
+
+    /// Issue #301: Remove a token from the supported tokens list (admin only).
+    pub fn remove_supported_token(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedToken(token_address.clone()), &false);
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SupportedTokens)
+            .unwrap_or(Vec::new(&env));
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens.get(i).unwrap() == token_address {
+                tokens.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupportedTokens, &tokens);
+        Self::bump_ttl(&env, &DataKey::SupportedTokens, LONG_LIVE_TTL);
+        env.events().publish(
+            (Symbol::new(&env, "TOKEN"), Symbol::new(&env, "REMOVED")),
+            token_address,
+        );
+        Ok(())
+    }
+
+    /// Issue #301: Return the list of supported token addresses.
+    pub fn get_supported_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SupportedTokens)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Issue #303: Set per‑tier KYC payment limits (admin only).
+    pub fn set_kyc_tier_limits(
+        env: Env,
+        admin: Address,
+        tier: KycTier,
+        max_amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::KycTierLimitsConfig, &KycTierLimits {
+                tier,
+                max_amount,
+            });
+        Self::bump_ttl(&env, &DataKey::KycTierLimitsConfig, LONG_LIVE_TTL);
+        Ok(())
+    }
+
+    /// Issue #303: Set the FX oracle contract address (admin only).
+    pub fn set_fx_oracle_address(
+        env: Env,
+        admin: Address,
+        oracle_address: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::FXOracleAddress, &oracle_address);
+        Self::bump_ttl(&env, &DataKey::FXOracleAddress, LONG_LIVE_TTL);
         Ok(())
     }
 
@@ -3723,6 +4067,29 @@ impl PaymentProcessor {
 
         Self::enforce_amount_limits(&env, &args.merchant_id, args.amount)?;
 
+        // Issue #303: Enforce KYC tier per-payment limit when merchant registry is configured
+        if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            if let Ok(Ok(merchant)) = registry_client.try_get_merchant(&args.merchant_id) {
+                if let Some(limits) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, KycTierLimits>(&DataKey::KycTierLimitsConfig)
+                {
+                    if limits.tier == merchant.kyc_tier {
+                        if args.amount > limits.max_amount {
+                            return Err(Error::AmountAboveMax);
+                        }
+                    }
+                }
+            }
+        }
+
         if env
             .storage()
             .persistent()
@@ -3765,6 +4132,8 @@ impl PaymentProcessor {
             metadata_hash: args.metadata_hash.clone(),
             original_token: None,
             swap_path: None,
+            fx_rate: None,
+            fx_rate_at: None,
         };
 
         env.storage()
@@ -3867,6 +4236,30 @@ impl PaymentProcessor {
 
             Self::enforce_amount_limits(&env, &args.merchant_id, args.amount)?;
 
+            if let Some(limits) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, KycTierLimits>(&DataKey::KycTierLimitsConfig)
+            {
+                if let Some(registry_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+                {
+                    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
+                        &env,
+                        &registry_address,
+                    );
+                    if let Ok(Ok(merchant)) =
+                        registry_client.try_get_merchant(&args.merchant_id)
+                    {
+                        if limits.tier == merchant.kyc_tier && args.amount > limits.max_amount {
+                            return Err(Error::AmountAboveMax);
+                        }
+                    }
+                }
+            }
+
             if env
                 .storage()
                 .persistent()
@@ -3925,6 +4318,8 @@ impl PaymentProcessor {
                 metadata_hash: None,
                 original_token: None,
                 swap_path: None,
+                fx_rate: None,
+                fx_rate_at: None,
             };
 
             env.storage()
@@ -4087,6 +4482,33 @@ impl PaymentProcessor {
             Self::enforce_tier_volume_cap(&env, &payment.merchant_id, amount_received)?;
         }
 
+        // Issue #304: Check FX rate freshness when both registry and oracle address are configured
+        if new_status == PaymentStatus::Confirmed || new_status == PaymentStatus::Overpaid {
+            if let Some(_registry_address) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+            {
+                if let Some(oracle_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::FXOracleAddress)
+                {
+                    let oracle_client =
+                        crate::fx_oracle::FXOracleClient::new(&env, &oracle_address);
+                    match oracle_client.try_get_rate(&payment.currency) {
+                        Ok(Ok(rate_data)) => {
+                            payment.fx_rate = Some(rate_data.rate);
+                            payment.fx_rate_at = Some(rate_data.updated_at);
+                        }
+                        _ => {
+                            return Err(Error::StaleOracleRate);
+                        }
+                    }
+                }
+            }
+        }
+
         payment.status = new_status.clone();
 
         env.storage()
@@ -4247,6 +4669,19 @@ impl PaymentProcessor {
             return Err(Error::Unauthorized);
         }
 
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ReentrancyLock)
+            .unwrap_or(false)
+        {
+            return Err(Error::Reentrancy);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReentrancyLock, &true);
+        let _guard = ReentrancyGuard { env: &env };
+
         let mut payment = Self::get_payment_internal(&env, &payment_id)?;
 
         if payment.status != PaymentStatus::Confirmed {
@@ -4257,6 +4692,90 @@ impl PaymentProcessor {
             return Err(Error::InvalidSettlement);
         }
 
+        // Check if merchant registry is configured and merchant has FeeConfig
+        let registry_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress);
+
+        if let Some(registry_addr) = registry_address {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_addr);
+
+            // Try to get merchant and their fee config
+            if let Ok(merchant) = registry_client.get_merchant(&payment.merchant_id) {
+                if let Some(fee_config) = merchant.fee_config.as_option() {
+                    // Calculate fee using merchant's FeeConfig
+                    let fee_bps_amount = (payment.amount * (fee_config.platform_fee_bps as i128)) / 10_000;
+                    let fixed_fee = fee_config.fixed_fee;
+                    let total_merchant_fee = fee_bps_amount.saturating_add(fixed_fee);
+
+                    // Ensure fee doesn't exceed amount
+                    let actual_fee = if total_merchant_fee >= payment.amount {
+                        payment.amount
+                    } else {
+                        total_merchant_fee
+                    };
+
+                    let net_merchant_amount = payment.amount.saturating_sub(actual_fee);
+
+                    // Get fee recipient
+                    let fee_recipient = if let Some(custom_recipient) = &fee_config.fee_recipient {
+                        custom_recipient.clone()
+                    } else {
+                        // Default to admin if no custom recipient
+                        AccessControl::get_admin(&env).unwrap_or_else(|| env.current_contract_address())
+                    };
+
+                    // Transfer to USDC token if configured
+                    if let Some(usdc_token_address) = env
+                        .storage()
+                        .persistent()
+                        .get::<DataKey, Address>(&DataKey::UsdcToken)
+                    {
+                        let token_client = token::TokenClient::new(&env, &usdc_token_address);
+                        let from = env.current_contract_address();
+
+                        // Transfer net amount to merchant
+                        if net_merchant_amount > 0 {
+                            let _ = token_client.try_transfer(&from, &payment.merchant_id, &net_merchant_amount);
+                        }
+
+                        // Transfer fee to fee_recipient
+                        if actual_fee > 0 {
+                            let _ = token_client.try_transfer(&from, &fee_recipient, &actual_fee);
+                        }
+                    }
+
+                    // Emit FEE_COLLECTED event
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "PAYMENT"),
+                            Symbol::new(&env, "FEE_COLLECTED"),
+                        ),
+                        (
+                            payment_id.clone(),
+                            payment.merchant_id.clone(),
+                            payment.amount,
+                            fee_bps_amount,
+                            fixed_fee,
+                            net_merchant_amount,
+                            fee_recipient,
+                        ),
+                    );
+
+                    payment.status = PaymentStatus::Settled;
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Payment(payment_id.clone()), &payment);
+                    Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+
+                    return Ok(());
+                }
+            }
+        }
+
+        // Original split-based settlement logic (no FeeConfig or no registry)
         let (platform_fee, fee_recipient) = if let Some(registry_address) = env
             .storage()
             .persistent()
@@ -4314,6 +4833,34 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
+
+    pub fn prune_expired_payments(
+        env: Env,
+        operator: Address,
+        payment_ids: Vec<String>,
+    ) -> Result<u32, Error> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut pruned_count: u32 = 0;
+        let current_timestamp = env.ledger().timestamp();
+
+        for payment_id in payment_ids.iter() {
+            if let Ok(payment) = Self::get_payment_internal(&env, &payment_id) {
+                if payment.status == PaymentStatus::Pending && payment.expires_at <= current_timestamp {
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::Payment(payment_id.clone()));
+                    pruned_count = pruned_count.saturating_add(1);
+                }
+            }
+        }
+
+        Ok(pruned_count)
     }
 
     /// Validate DEX path quotes before executing a swap.
@@ -4896,6 +5443,17 @@ impl PaymentProcessor {
 
     pub fn get_stream_fee_bps(env: Env) -> i128 {
         PaymentStreaming::get_stream_fee_bps(env)
+    }
+
+    pub fn upgrade_contract(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
     }
 }
 

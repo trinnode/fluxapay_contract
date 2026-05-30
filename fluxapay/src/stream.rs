@@ -39,6 +39,8 @@ pub struct PaymentStream {
     pub token: Address,
     /// Current flow rate in the smallest token unit per second.
     pub rate_per_second: i128,
+    /// Minimum allowed rate per second for this stream; prevents rate from falling below this.
+    pub min_rate_per_second: i128,
     /// Total deposit locked in this contract on behalf of the stream.
     pub remaining_deposit: i128,
     /// Ledger timestamp of the last checkpoint.
@@ -98,6 +100,8 @@ pub enum StreamError {
     MilestoneNotApproved = 10,
     /// Withdrawal already in progress (reentrancy guard).
     WithdrawalInProgress = 11,
+    /// The new rate is below the minimum allowed rate for this stream.
+    RateBelowMinimum = 12,
 }
 
 /// Storage key for the per-stream withdrawal reentrancy lock.
@@ -241,6 +245,7 @@ impl PaymentStreaming {
         rate_per_second: i128,
         deposit: i128,
         stream_id: String,
+        min_rate: Option<i128>,
     ) -> Result<PaymentStream, StreamError> {
         sender.require_auth();
 
@@ -259,6 +264,7 @@ impl PaymentStreaming {
         }
 
         let now = env.ledger().timestamp();
+        let min_rate_per_second = min_rate.unwrap_or(1);
         let stream = PaymentStream {
             stream_id: stream_id.clone(),
             sender,
@@ -266,6 +272,7 @@ impl PaymentStreaming {
             destination: None,
             token: token.clone(),
             rate_per_second,
+            min_rate_per_second,
             remaining_deposit: deposit,
             last_checkpoint_at: now,
             accrued_at_checkpoint: 0,
@@ -425,6 +432,9 @@ impl PaymentStreaming {
         }
         if new_rate >= stream.rate_per_second {
             return Err(StreamError::RateNotDecreased);
+        }
+        if new_rate < stream.min_rate_per_second {
+            return Err(StreamError::RateBelowMinimum);
         }
 
         let now = env.ledger().timestamp();

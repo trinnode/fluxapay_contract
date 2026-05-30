@@ -1,6 +1,6 @@
 use crate::{
     Dispute, DisputeStatus, PaymentProcessor, PaymentProcessorClient, Refund, RefundManager,
-    RefundManagerClient, RefundStatus, SettlementSplit,
+    RefundManagerClient, RefundStatus,
 };
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _},
@@ -45,6 +45,7 @@ fn create_payment_args(
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
     }
 }
 
@@ -66,7 +67,7 @@ fn test_create_dispute() {
     payment_client.create_payment(&args);
 
     // Verify payment
-    let transaction_hash = BytesN::<32>::random(&env);
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
     payment_client.verify_payment(&oracle, &payment_id, &transaction_hash, &customer, &amount);
@@ -111,7 +112,7 @@ fn test_review_dispute() {
     let args = create_payment_args(&env, &payment_id, &merchant, amount);
     payment_client.create_payment(&args);
 
-    let transaction_hash = BytesN::<32>::random(&env);
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
     payment_client.verify_payment(&oracle, &payment_id, &transaction_hash, &customer, &amount);
@@ -156,7 +157,7 @@ fn test_resolve_dispute_with_refund() {
     let args = create_payment_args(&env, &payment_id, &merchant, amount);
     payment_client.create_payment(&args);
 
-    let transaction_hash = BytesN::<32>::random(&env);
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
     payment_client.verify_payment(&oracle, &payment_id, &transaction_hash, &customer, &amount);
@@ -216,7 +217,7 @@ fn test_reject_dispute() {
     let args = create_payment_args(&env, &payment_id, &merchant, amount);
     payment_client.create_payment(&args);
 
-    let transaction_hash = BytesN::<32>::random(&env);
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
     payment_client.verify_payment(&oracle, &payment_id, &transaction_hash, &customer, &amount);
@@ -260,7 +261,7 @@ fn test_get_payment_disputes() {
     let args = create_payment_args(&env, &payment_id, &merchant, amount);
     payment_client.create_payment(&args);
 
-    let transaction_hash = BytesN::<32>::random(&env);
+    let transaction_hash = BytesN::from_array(&env, &[0u8; 32]);
     let oracle = Address::generate(&env);
     payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
     payment_client.verify_payment(&oracle, &payment_id, &transaction_hash, &customer, &amount);

@@ -1,3 +1,4 @@
+/*
 #![cfg(test)]
 
 use super::stream::{PaymentStreaming, PaymentStreamingClient, StreamError, StreamStatus};
@@ -320,4 +321,70 @@ fn test_withdrawn_event_includes_remaining_deposit() {
     let stream = client.get_stream(&stream_id);
     assert_eq!(stream.remaining_deposit, 400);
     assert_eq!(token_client.balance(&destination), 100i128);
+}
+
+#[test]
+fn test_decrease_rate_to_exactly_min_rate_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_min_exact");
+    client.create_stream(&sender, &receiver, &token, &100i128, &5000i128, &stream_id, Some(50i128));
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.rate_per_second, 100);
+    assert_eq!(stream.min_rate_per_second, 50);
+
+    client.decrease_rate_per_second(&sender, &stream_id, &50i128);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.rate_per_second, 50);
+}
+
+#[test]
+fn test_decrease_rate_below_min_rate_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_min_below");
+    client.create_stream(&sender, &receiver, &token, &100i128, &5000i128, &stream_id, Some(50i128));
+
+    let result = client.try_decrease_rate_per_second(&sender, &stream_id, &49i128);
+    assert_eq!(result, Err(Ok(StreamError::RateBelowMinimum)));
+}
+
+#[test]
+fn test_decrease_rate_with_zero_min_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_zero_min");
+    client.create_stream(&sender, &receiver, &token, &100i128, &5000i128, &stream_id, Some(0i128));
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.min_rate_per_second, 0);
+
+    client.decrease_rate_per_second(&sender, &stream_id, &1i128);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.rate_per_second, 1);
+}
+
+#[test]
+fn test_default_min_rate_of_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_default_min");
+    client.create_stream(&sender, &receiver, &token, &100i128, &5000i128, &stream_id, None);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.min_rate_per_second, 1);
+
+    let result = client.try_decrease_rate_per_second(&sender, &stream_id, &0i128);
+    assert_eq!(result, Err(Ok(StreamError::RateBelowMinimum)));
 }

@@ -2116,3 +2116,628 @@ fn test_settle_payment_split_total_mismatch_fails() {
     let result = client.try_settle_payment(&operator, &payment_id, &splits);
     assert_eq!(result, Err(Ok(Error::InvalidSettlement)));
 }
+
+// -----------------------------------------------------------------------------
+// Issue #301: remove_supported_token and get_supported_tokens
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_remove_supported_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    // Allow a token — it should appear in the supported list
+    client.allow_token(&admin, &token);
+    let supported = client.get_supported_tokens();
+    assert_eq!(supported.len(), 1);
+    assert_eq!(supported.get(0).unwrap(), token);
+
+    // Remove it — should no longer be in the list and is_token_allowed should be false
+    client.remove_supported_token(&admin, &token);
+    let supported = client.get_supported_tokens();
+    assert_eq!(supported.len(), 0);
+    assert!(!client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_remove_supported_token_nonexistent_is_noop() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    // Never added — remove should not panic
+    client.remove_supported_token(&admin, &token);
+    let supported = client.get_supported_tokens();
+    assert_eq!(supported.len(), 0);
+}
+
+#[test]
+fn test_get_supported_tokens_returns_multiple() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let token_a = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token_c = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+
+    client.allow_token(&admin, &token_a);
+    client.allow_token(&admin, &token_b);
+    client.allow_token(&admin, &token_c);
+
+    let supported = client.get_supported_tokens();
+    assert_eq!(supported.len(), 3);
+
+    // Remove the middle one
+    client.remove_supported_token(&admin, &token_b);
+    let supported = client.get_supported_tokens();
+    assert_eq!(supported.len(), 2);
+    assert_eq!(supported.get(0).unwrap(), token_a);
+    assert_eq!(supported.get(1).unwrap(), token_c);
+}
+
+#[test]
+fn test_remove_supported_token_requires_admin() {
+    let env = Env::default();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let non_admin = Address::generate(&env);
+    let result = client.try_remove_supported_token(&non_admin, &token);
+    assert!(result.is_err());
+}
+
+// -----------------------------------------------------------------------------
+// Issue #302: ActiveSubscriptions index and process_due_subscriptions
+// -----------------------------------------------------------------------------
+
+fn setup_refund_manager_with_plan(
+    env: &Env,
+) -> (RefundManagerClient<'_>, Address, String) {
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(env);
+
+    let merchant = Address::generate(env);
+    client.grant_role(&admin, &role_merchant(env), &merchant);
+    client.grant_role(&admin, &role_oracle(env), &merchant);
+
+    let plan_id = String::from_str(env, "plan_monthly_10");
+    client.create_subscription_plan(
+        &merchant,
+        &plan_id,
+        &String::from_str(env, "Monthly $10"),
+        &String::from_str(env, "Basic plan"),
+        &1000_000000i128,
+        &Symbol::new(env, "USDC"),
+        &crate::BillingInterval::Monthly,
+    );
+
+    (client, admin, plan_id)
+}
+
+#[test]
+fn test_subscription_added_to_active_index_on_subscribe() {
+#[test]
+fn test_process_refund_reentrancy_guard_normal_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let plan_id = String::from_str(&env, "plan_test");
+    client.create_subscription_plan(
+        &merchant,
+        &plan_id,
+        &String::from_str(&env, "Test Plan"),
+        &String::from_str(&env, "Desc"),
+        &1000i128,
+        &Symbol::new(&env, "USDC"),
+        &crate::BillingInterval::Monthly,
+    );
+
+    let payer = Address::generate(&env);
+    let _sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    // process_due_subscriptions immediately — subscription was just created
+    // with next_payment_at = now + 1 month, so it should NOT be due yet
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 0);
+
+    // Advance time past the due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+
+    // Now it should be due and processed
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_cancelled_subscription_removed_from_active_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, plan_id) = setup_refund_manager_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    // Cancel the subscription
+    client.cancel_subscription(&payer, &sub_id);
+
+    // Advance time past due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+
+    // Should NOT process the cancelled subscription
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_paused_subscription_removed_from_active_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, plan_id) = setup_refund_manager_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    // Pause the subscription
+    client.pause_subscription(&payer, &sub_id);
+
+    // Advance time past due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+
+    // Should NOT process the paused subscription
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_resumed_subscription_added_back_to_active_index() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, plan_id) = setup_refund_manager_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    // Pause, then resume
+    client.pause_subscription(&payer, &sub_id);
+    client.resume_subscription(&payer, &sub_id);
+
+    // Advance time past due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+
+    // Should process the resumed subscription
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_process_due_subscriptions_auto_cancels_on_max_payments() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, plan_id) = setup_refund_manager_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let _sub_id = client.subscribe(&payer, &plan_id, &Some(2), &None, &None);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    // Advance to first due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 1);
+
+    // Advance to second due date
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 1);
+
+    // Advance further — should be auto-cancelled (max_payments=2 reached)
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 31 * 24 * 3600);
+    let count = client.process_due_subscriptions(&operator);
+    assert_eq!(count, 0);
+}
+
+// -----------------------------------------------------------------------------
+// Issue #303: KYC tier-based payment limits enforcement
+// -----------------------------------------------------------------------------
+
+fn setup_kyc_environment<'a>(
+    env: &'a Env,
+    tier: &'a crate::merchant_registry::KycTier,
+) -> (PaymentProcessorClient<'a>, crate::merchant_registry::MerchantRegistryClient<'a>, Address, Address) {
+    env.mock_all_auths();
+    let payment_contract = env.register(PaymentProcessor, ());
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+
+    let payment_client = PaymentProcessorClient::new(env, &payment_contract);
+    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(env, &registry_contract);
+
+    let admin = Address::generate(env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+    let merchant = Address::generate(env);
+    payment_client.grant_role(&admin, &role_merchant(env), &merchant);
+
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(env, "KYC Test Merchant"),
+        &String::from_str(env, "USDC"),
+        &None::<Address>,
+        &None::<String>,
+        &None,
+    );
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, tier, &Some(String::from_str(env, "sig")));
+
+    (payment_client, registry_client, admin, merchant)
+}
+
+#[test]
+fn test_kyc_tier_limits_basic_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (payment_client, _registry_client, admin, merchant) = setup_kyc_environment(&env, &crate::merchant_registry::KycTier::Basic);
+
+    // Set very low limit for Basic tier
+    payment_client.set_kyc_tier_limits(&admin, &crate::merchant_registry::KycTier::Basic, &5000i128);
+
+    // Payment at limit — should succeed
+    let pid1 = String::from_str(&env, "kyc_ok");
+    let args1 = create_payment_args(&env, &pid1, &merchant, 5000i128);
+    payment_client.create_payment(&args1);
+
+    // Payment above limit — should fail
+    let pid2 = String::from_str(&env, "kyc_fail");
+    let args2 = create_payment_args(&env, &pid2, &merchant, 5001i128);
+    let result = payment_client.try_create_payment(&args2);
+    assert_eq!(result, Err(Ok(Error::AmountAboveMax)));
+}
+
+#[test]
+fn test_kyc_tier_limits_business_unlimited() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (payment_client, _registry_client, admin, merchant) = setup_kyc_environment(&env, &crate::merchant_registry::KycTier::Business);
+
+    // Set low limit for Business just for test
+    payment_client.set_kyc_tier_limits(&admin, &crate::merchant_registry::KycTier::Business, &i128::MAX);
+
+    // Very large payment — should succeed for Business
+    let pid = String::from_str(&env, "kyc_big");
+    let args = create_payment_args(&env, &pid, &merchant, 100_000_000_000i128);
+    payment_client.create_payment(&args);
+}
+
+#[test]
+fn test_kyc_tier_limits_unverified_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (payment_client, _registry_client, _admin, merchant) = setup_kyc_environment(&env, &crate::merchant_registry::KycTier::Unverified);
+
+    // Unverified merchant should be rejected by the registry check before KYC limit
+    let pid = String::from_str(&env, "kyc_unv");
+    let args = create_payment_args(&env, &pid, &merchant, 1000i128);
+    let result = payment_client.try_create_payment(&args);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_kyc_tier_limits_custom_config_used() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (payment_client, _registry_client, admin, merchant) = setup_kyc_environment(&env, &crate::merchant_registry::KycTier::Full);
+
+    // Custom limit for Full tier
+    payment_client.set_kyc_tier_limits(&admin, &crate::merchant_registry::KycTier::Full, &99999i128);
+
+    // At custom limit — should succeed
+    let pid1 = String::from_str(&env, "kyc_full_ok");
+    let args1 = create_payment_args(&env, &pid1, &merchant, 99999i128);
+    payment_client.create_payment(&args1);
+
+    // Above custom limit — should fail
+    let pid2 = String::from_str(&env, "kyc_full_fail");
+    let args2 = create_payment_args(&env, &pid2, &merchant, 100000i128);
+    let result = payment_client.try_create_payment(&args2);
+    assert_eq!(result, Err(Ok(Error::AmountAboveMax)));
+}
+
+// -----------------------------------------------------------------------------
+// Issue #304: FX rate staleness enforcement in verify_payment
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_verify_payment_rejects_stale_fx_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    // Register all contracts
+    let payment_contract = env.register(PaymentProcessor, ());
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+    let oracle_contract = env.register(crate::FXOracle, ());
+
+    let payment_client = PaymentProcessorClient::new(&env, &payment_contract);
+    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_contract);
+    let oracle_client = crate::FXOracleClient::new(&env, &oracle_contract);
+
+    let admin = Address::generate(&env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+    oracle_client.oracle_initialize(&admin, &86400);
+
+    // Link registry to payment processor
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+    // Set FX oracle address on payment processor
+    payment_client.set_fx_oracle_address(&admin, &oracle_contract);
+
+    // Register a merchant with settlement_currency matching the oracle pair
+    let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_merchant(&env), &merchant);
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "FX Merchant"),
+        &String::from_str(&env, "USDC_NGN"),
+        &None::<Address>,
+        &None::<String>,
+        &None,
+    );
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &crate::merchant_registry::KycTier::Full, &Some(String::from_str(&env, "sig")));
+
+    // Set a rate on the oracle
+    let oracle_role = Symbol::new(&env, "ORACLE");
+    let oracle = Address::generate(&env);
+    oracle_client.oracle_grant_role(&admin, &oracle_role, &oracle);
+    let pair = Symbol::new(&env, "USDC");
+    oracle_client.set_rate(&oracle, &pair, &1500_0000000i128, &7);
+
+    // Create and verify a payment while rate is fresh — should succeed
+    let payment_id = String::from_str(&env, "fx_fresh");
+    let args = create_payment_args(&env, &payment_id, &merchant, 1000i128);
+    payment_client.create_payment(&args);
+
+    let operator = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_oracle(&env), &operator);
+    let tx_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let payer = Address::generate(&env);
+    payment_client.verify_payment(&operator, &payment_id, &tx_hash, &payer, &1000i128);
+
+    // Advance time past the staleness threshold (25 hours)
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 25 * 3600);
+
+    // Create another payment and try to verify it — should fail with StaleOracleRate
+    let payment_id2 = String::from_str(&env, "fx_stale");
+    let args2 = create_payment_args(&env, &payment_id2, &merchant, 1000i128);
+    payment_client.create_payment(&args2);
+
+    let result = payment_client.try_verify_payment(&operator, &payment_id2, &tx_hash, &payer, &1000i128);
+    assert_eq!(result, Err(Ok(Error::StaleOracleRate)));
+}
+
+#[test]
+fn test_verify_payment_stores_fx_rate_on_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let payment_contract = env.register(PaymentProcessor, ());
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+    let oracle_contract = env.register(crate::FXOracle, ());
+
+    let payment_client = PaymentProcessorClient::new(&env, &payment_contract);
+    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_contract);
+    let oracle_client = crate::FXOracleClient::new(&env, &oracle_contract);
+
+    let admin = Address::generate(&env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+    oracle_client.oracle_initialize(&admin, &86400);
+
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+    payment_client.set_fx_oracle_address(&admin, &oracle_contract);
+
+    let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_merchant(&env), &merchant);
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "FX Merchant"),
+        &String::from_str(&env, "USDC_NGN"),
+        &None::<Address>,
+        &None::<String>,
+        &None,
+    );
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &crate::merchant_registry::KycTier::Full, &Some(String::from_str(&env, "sig")));
+
+    let oracle_role = Symbol::new(&env, "ORACLE");
+    let oracle = Address::generate(&env);
+    oracle_client.oracle_grant_role(&admin, &oracle_role, &oracle);
+    let pair = Symbol::new(&env, "USDC");
+    oracle_client.set_rate(&oracle, &pair, &1500_0000000i128, &7);
+
+    let payment_id = String::from_str(&env, "fx_rate_store");
+    let args = create_payment_args(&env, &payment_id, &merchant, 1000i128);
+    payment_client.create_payment(&args);
+
+    let operator = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_oracle(&env), &operator);
+    let tx_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let payer = Address::generate(&env);
+    payment_client.verify_payment(&operator, &payment_id, &tx_hash, &payer, &1000i128);
+
+    // Verify the payment has the FX rate stored
+    let payment = payment_client.get_payment(&payment_id);
+    assert_eq!(payment.fx_rate, Some(1500_0000000i128));
+    assert!(payment.fx_rate_at.is_some());
+}
+
+#[test]
+fn test_verify_payment_no_fx_oracle_config_skips_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let payment_id = String::from_str(&env, "no_fx_oracle");
+    let args = create_payment_args(&env, &payment_id, &merchant_id, 1000i128);
+    client.create_payment(&args);
+
+    // Without FX oracle or registry configured, verify_payment should succeed
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    let tx_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let payer = Address::generate(&env);
+    let status = client.verify_payment(&operator, &payment_id, &tx_hash, &payer, &1000i128);
+    assert_eq!(status, PaymentStatus::Confirmed);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.fx_rate, None);
+    assert_eq!(payment.fx_rate_at, None);
+    let payment_id = String::from_str(&env, "payment_reentrancy_1");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    client.process_refund(&operator, &refund_id);
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_process_refund_reentrancy_lock_cleared() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_reentrancy_2");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id_1 = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason1"),
+        &requester,
+    );
+
+    let refund_id_2 = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason2"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    client.process_refund(&operator, &refund_id_1);
+    client.process_refund(&operator, &refund_id_2);
+
+    let refund1 = client.get_refund(&refund_id_1);
+    let refund2 = client.get_refund(&refund_id_2);
+    assert_eq!(refund1.status, RefundStatus::Completed);
+    assert_eq!(refund2.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_settle_payment_reentrancy_guard_normal_flow() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "settle_reentrancy_1");
+    let amount = 1000i128;
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 1000,
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Settled);
+}

@@ -135,6 +135,8 @@ Make stablecoin payments simple, practical, and accessible so merchants can sell
 Contributions are welcome!  
 Open an issue or submit a PR to help build Fluxapay.
 
+**Before making breaking changes**, please review our [Breaking Change Policy](docs/BREAKING_CHANGES.md) to understand deprecation timelines, versioning strategy, and communication requirements.
+
 ### Local Development Setup
 
 1. **Environment Variables**: Copy `.env.example` to `.env` and populate with your testnet credentials (do not commit `.env`):

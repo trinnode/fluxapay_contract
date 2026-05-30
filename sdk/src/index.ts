@@ -263,6 +263,8 @@ export class FluxapayClient {
   }
 }
 
+export { toFluxapayError, withMappedContractError };
+
 export {
   Merchant,
   PaymentCharge,
@@ -284,3 +286,6 @@ export {
   NetworkProfiles,
   NetworkProfile,
 };
+
+export { RefundManagerClient, type RefundManagerConfig } from "./contracts/refund-manager.js";
+export { MerchantRegistryClient, type MerchantRegistryConfig } from "./contracts/merchant-registry.js";

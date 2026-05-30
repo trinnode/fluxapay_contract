@@ -1,0 +1,56 @@
+name: Changelog Check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changelog-check:
+    name: Verify CHANGELOG.md updated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if CHANGELOG.md was modified
+        id: changelog_check
+        run: |
+          # Check if CHANGELOG.md was modified in this PR
+          git fetch origin ${{ github.base_ref }}
+          MODIFIED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -c "^CHANGELOG.md$" || true)
+          echo "changelog_modified=$MODIFIED" >> $GITHUB_OUTPUT
+
+      - name: Check for skip-changelog label
+        id: label_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if PR has skip-changelog label
+          SKIP_LABEL=$(gh pr view ${{ github.event.pull_request.number }} --json labels --jq '.labels[].name' | grep -c "skip-changelog" || true)
+          echo "has_skip_label=$SKIP_LABEL" >> $GITHUB_OUTPUT
+
+      - name: Fail if CHANGELOG not updated and no skip label
+        if: steps.changelog_check.outputs.changelog_modified == '0' && steps.label_check.outputs.has_skip_label == '0'
+        run: |
+          echo "❌ CHANGELOG.md was not modified in this PR."
+          echo ""
+          echo "Please update CHANGELOG.md with your changes under the 'Unreleased' section."
+          echo "Follow the Keep a Changelog format: Added/Changed/Fixed/Removed."
+          echo ""
+          echo "If this PR does not require a changelog entry, add the 'skip-changelog' label."
+          exit 1
+
+      - name: Success message
+        if: steps.changelog_check.outputs.changelog_modified != '0' || steps.label_check.outputs.has_skip_label != '0'
+        run: |
+          if [ "${{ steps.changelog_check.outputs.changelog_modified }}" != "0" ]; then
+            echo "✅ CHANGELOG.md was updated."
+          else
+            echo "✅ PR is marked with 'skip-changelog' label."
+          fi
